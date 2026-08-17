@@ -9,6 +9,7 @@ from langchain_core.embeddings import Embeddings
 from app.config import settings
 from app.embeddings import get_embeddings
 from app.rag.contracts import KnowledgeDomain, RetrievedChunk
+from app.resilience import retry_transient
 from app.services.supabase import get_supabase
 
 
@@ -28,7 +29,7 @@ def retrieve_knowledge(
     match_limit = max(1, min(limit or settings.rag_retrieval_limit, 20))
     threshold = settings.rag_min_similarity if min_similarity is None else min_similarity
     vector = (embeddings or get_embeddings()).embed_query(cleaned_query)
-    response = (supabase or get_supabase()).rpc(
+    request = (supabase or get_supabase()).rpc(
         "match_knowledge_chunks",
         {
             "query_embedding": vector,
@@ -38,7 +39,11 @@ def retrieve_knowledge(
             # retrieve English guidance for Russian/French/Spanish/Chinese queries.
             "filter_language": None,
         },
-    ).execute()
+    )
+    response = retry_transient(
+        request.execute,
+        operation_name="supabase.read.match_knowledge_chunks",
+    )
     return [
         chunk
         for row in (response.data or [])

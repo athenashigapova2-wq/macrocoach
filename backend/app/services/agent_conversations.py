@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from app.resilience import retry_transient
 from app.services.supabase import get_supabase
 
 
@@ -13,13 +14,16 @@ def prepare_conversation(
 ) -> tuple[str, list[dict[str, str]]]:
     client = get_supabase()
     if conversation_id:
-        response = (
+        query = (
             client.table("agent_conversations")
             .select("id")
             .eq("id", conversation_id)
             .eq("user_id", user_id)
             .limit(1)
-            .execute()
+        )
+        response = retry_transient(
+            query.execute,
+            operation_name="supabase.read.agent_conversation",
         )
         if not response.data:
             raise ValueError("Conversation not found")
@@ -40,13 +44,16 @@ def prepare_conversation(
             raise RuntimeError("Supabase did not return the created conversation")
         conversation_id = str(response.data[0]["id"])
 
-    history_response = (
+    history_query = (
         client.table("agent_messages")
         .select("role, content")
         .eq("conversation_id", conversation_id)
         .order("created_at", desc=True)
         .limit(20)
-        .execute()
+    )
+    history_response = retry_transient(
+        history_query.execute,
+        operation_name="supabase.read.agent_messages",
     )
     rows: list[dict[str, Any]] = history_response.data or []
     history = [

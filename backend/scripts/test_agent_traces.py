@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agents.specialists import _invoke_tool  # noqa: E402
+from app.model_routing import ModelSelection  # noqa: E402
 from app.services import agent_traces  # noqa: E402
 
 
@@ -29,6 +30,7 @@ def main() -> None:
         assert insert_payload["user_id"] == "user-id"
         assert insert_payload["status"] == "started"
         assert insert_payload["input_text"] == "Что я сегодня съела?"
+        assert insert_payload["model_provider"] == "gigachat"
         assert insert_payload["baseline_version"] == "baseline-v1"
         assert insert_payload["resolution_mode"] == "main_llm"
 
@@ -89,17 +91,40 @@ def main() -> None:
         },
     )
     query.execute.return_value = SimpleNamespace(data=[{"id": "llm-call-id"}])
+    selection = ModelSelection(
+        provider="gigachat",
+        requested_model_tier="small",
+        model_tier="main",
+        model_name="GigaChat-2",
+        matched_rule="router.route_classification",
+        selection_reason="matched router rule",
+        is_fallback=True,
+        fallback_reason="small model is not configured",
+    )
     with patch("app.services.agent_traces.get_supabase", return_value=query):
         llm_call_id = agent_traces.create_llm_call(
             run_id="run-id",
             node_name="router",
             purpose="route_classification",
-            model_tier="small",
+            model_tier="main",
+            invocation_id="11111111-1111-4111-8111-111111111111",
+            attempt_number=2,
+            model_selection=selection,
+            retry_reason="ReadTimeout",
         )
         assert llm_call_id == "llm-call-id"
         llm_insert = query.insert.call_args.args[0]
         assert llm_insert["node_name"] == "router"
-        assert llm_insert["model_tier"] == "small"
+        assert llm_insert["model_tier"] == "main"
+        assert llm_insert["requested_model_tier"] == "small"
+        assert llm_insert["model_provider"] == "gigachat"
+        assert llm_insert["model_name"] == "GigaChat-2"
+        assert llm_insert["attempt_number"] == 2
+        assert llm_insert["retry_reason"] == "ReadTimeout"
+        assert llm_insert["routing_rule"] == "router.route_classification"
+        assert llm_insert["selection_reason"] == "matched router rule"
+        assert llm_insert["is_fallback"] is True
+        assert llm_insert["fallback_reason"] == "small model is not configured"
 
         query.eq.reset_mock()
         agent_traces.succeed_llm_call(

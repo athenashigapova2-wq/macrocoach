@@ -3,17 +3,18 @@
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
+from app.circuit_breaker import call_with_circuit_breaker
 from app.config import settings
+from app.model_routing import ModelSelection, model_name_for_tier
 from app.services.supabase import get_supabase
+
+MODEL_PROVIDER = "gigachat"
 
 
 def _model_name(model_tier: str = "main") -> str:
-    if model_tier == "small" and settings.llm_router_model:
-        return settings.llm_router_model
-    if settings.llm_provider.lower() == "anthropic":
-        return settings.anthropic_model
-    return settings.gigachat_model
+    return model_name_for_tier(model_tier)
 
 
 def elapsed_ms(started_at: float) -> int:
@@ -38,7 +39,7 @@ def create_agent_run(
             {
                 "user_id": user_id,
                 "route": "general",
-                "model_provider": settings.llm_provider,
+                "model_provider": MODEL_PROVIDER,
                 "model_name": _model_name(),
                 "input_text": input_text,
                 "conversation_id": conversation_id,
@@ -128,8 +129,19 @@ def create_llm_call(
     node_name: str,
     purpose: str,
     model_tier: str,
+    model_name: str | None = None,
+    *,
+    invocation_id: str | None = None,
+    attempt_number: int = 1,
+    model_selection: ModelSelection | None = None,
+    retry_reason: str | None = None,
 ) -> str:
-    """Create one provider call so token accounting is auditable per invocation."""
+    """Create one row for one actual provider attempt."""
+    selection_payload = _model_selection_payload(
+        model_selection=model_selection,
+        model_tier=model_tier,
+        model_name=model_name,
+    )
     response = (
         get_supabase()
         .table("agent_llm_calls")
@@ -138,9 +150,11 @@ def create_llm_call(
                 "run_id": run_id,
                 "node_name": node_name,
                 "purpose": purpose,
-                "model_provider": settings.llm_provider,
-                "model_name": _model_name(model_tier),
-                "model_tier": model_tier,
+                "model_provider": MODEL_PROVIDER,
+                **selection_payload,
+                "invocation_id": invocation_id or str(uuid4()),
+                "attempt_number": attempt_number,
+                "retry_reason": retry_reason,
                 "status": "started",
             }
         )
@@ -149,6 +163,33 @@ def create_llm_call(
     if not response.data:
         raise RuntimeError("Supabase не вернул созданный agent_llm_call")
     return str(response.data[0]["id"])
+
+
+def _model_selection_payload(
+    *,
+    model_selection: ModelSelection | None,
+    model_tier: str,
+    model_name: str | None,
+) -> dict[str, Any]:
+    if model_selection is not None:
+        return {
+            "model_name": model_selection.model_name,
+            "model_tier": model_selection.model_tier,
+            "requested_model_tier": model_selection.requested_model_tier,
+            "routing_rule": model_selection.matched_rule,
+            "selection_reason": model_selection.selection_reason,
+            "is_fallback": model_selection.is_fallback,
+            "fallback_reason": model_selection.fallback_reason,
+        }
+    return {
+        "model_name": model_name or _model_name(model_tier),
+        "model_tier": model_tier,
+        "requested_model_tier": model_tier,
+        "routing_rule": "legacy",
+        "selection_reason": "model supplied without routing metadata",
+        "is_fallback": False,
+        "fallback_reason": None,
+    }
 
 
 def token_usage(message: Any) -> dict[str, int | bool]:
@@ -217,19 +258,65 @@ def invoke_llm(
     node_name: str,
     purpose: str,
     model_tier: str,
+    model_name: str | None = None,
+    model_selection: ModelSelection | None = None,
 ) -> Any:
-    """Invoke an LLM and persist its lifecycle when a traced run is available."""
-    if run_id is None:
-        return llm.invoke(messages)
-    llm_call_id = create_llm_call(run_id, node_name, purpose, model_tier)
-    started_at = perf_counter()
-    try:
-        message = llm.invoke(messages)
-    except Exception as exc:
-        fail_llm_call(llm_call_id, run_id, exc, elapsed_ms(started_at))
-        raise
-    succeed_llm_call(llm_call_id, run_id, message, elapsed_ms(started_at))
-    return message
+    """Invoke an LLM and persist every actual provider attempt."""
+    invocation_id = str(uuid4())
+    attempt_number = 0
+    retry_reason: str | None = None
+
+    def invoke_attempt() -> Any:
+        nonlocal attempt_number, retry_reason
+        attempt_number += 1
+        if run_id is None:
+            return llm.invoke(messages)
+
+        llm_call_id = create_llm_call(
+            run_id,
+            node_name,
+            purpose,
+            model_tier,
+            model_name=model_name,
+            invocation_id=invocation_id,
+            attempt_number=attempt_number,
+            model_selection=model_selection,
+            retry_reason=retry_reason,
+        )
+        started_at = perf_counter()
+        try:
+            message = llm.invoke(messages)
+        except Exception as error:
+            fail_llm_call(
+                llm_call_id,
+                run_id,
+                error,
+                elapsed_ms(started_at),
+            )
+            retry_reason = _retry_reason(error)
+            raise
+        succeed_llm_call(
+            llm_call_id,
+            run_id,
+            message,
+            elapsed_ms(started_at),
+        )
+        return message
+
+    return call_with_circuit_breaker(
+        invoke_attempt,
+        circuit_name=MODEL_PROVIDER,
+        operation_name=f"llm.{node_name}.{purpose}",
+    )
+
+
+def _retry_reason(error: BaseException) -> str:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is not None:
+        return f"{type(error).__name__}:http_{status}"
+    return type(error).__name__
 
 
 def succeed_tool_call(

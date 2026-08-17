@@ -15,17 +15,32 @@ def _translate_to_english(query: str) -> str:
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from app.llm import get_llm
+    from app.llm import get_routed_llm
+    from app.services import agent_traces
 
     try:
-        response = get_llm().invoke([
-            SystemMessage(content=(
-                "Translate the food name to English. "
-                "If it is already English, return it unchanged. "
-                "Reply with ONLY the English name, 1-2 words, no explanation."
-            )),
-            HumanMessage(content=query),
-        ])
+        llm, selection = get_routed_llm(
+            node_name="nutrition",
+            purpose="food_translation",
+            default_tier="small",
+            temperature=0.0,
+        )
+        response = agent_traces.invoke_llm(
+            llm,
+            [
+                SystemMessage(content=(
+                    "Translate the food name to English. "
+                    "If it is already English, return it unchanged. "
+                    "Reply with ONLY the English name, 1-2 words, no explanation."
+                )),
+                HumanMessage(content=query),
+            ],
+            run_id=None,
+            node_name="nutrition",
+            purpose="food_translation",
+            model_tier=selection.model_tier,
+            model_selection=selection,
+        )
         translated = response.content.strip().strip('."')
         return translated or query
     except Exception:

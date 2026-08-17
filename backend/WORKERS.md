@@ -31,6 +31,35 @@ API доступен на `http://127.0.0.1:8001`, Redis опубликован 
 Модель сохраняется в volume `hf-cache`, поэтому пересоздание контейнера не требует
 повторной загрузки.
 
+LLM-запросы и явно помеченные read-only инструменты повторяются только при временных
+сетевых ошибках, timeout, HTTP 429 и выбранных HTTP 5xx. Используется ограниченный
+экспоненциальный backoff с jitter. Операции записи (`log_meal`, `log_workout`) и
+Celery-задача целиком не повторяются, чтобы не создавать дубликаты данных.
+
+После исчерпания LLM retries общий Redis circuit breaker учитывает один логический
+сбой. При достижении порога состояние GigaChat меняется `closed → open`; после cooldown
+только один worker получает `half_open` probe lease. Успех закрывает circuit, временная
+ошибка открывает повторно. Проверка состояния:
+
+```powershell
+docker compose exec -T redis redis-cli HGETALL athena:circuit-breaker:gigachat
+```
+
+Отсутствующий ключ означает `closed`. При недоступности Redis breaker работает
+fail-open и не блокирует LLM сам по себе.
+
+Model routing настраивается через `LLM_MODEL_ROUTING_POLICY`: точные правила
+`node.purpose` имеют приоритет над `node.*`, затем `*.purpose` и `*`. Tier `small`
+использует `LLM_ROUTER_MODEL` с безопасным возвратом к `GIGACHAT_MODEL`, tier `main`
+всегда использует `GIGACHAT_MODEL`. Роутинг не переключает provider: все вызовы
+остаются в GigaChat, а фактическая модель записывается в traces.
+
+Одна строка `agent_llm_calls` теперь соответствует одной фактической provider-попытке.
+Retries группируются по `invocation_id` и нумеруются через `attempt_number`; routing
+rule, причина выбора, configuration fallback и причина retry сохраняются отдельными
+полями. До запуска обновлённого worker примените Supabase migration
+`0015_agent_llm_attempt_tracing.sql`.
+
 Просмотр логов:
 
 ```powershell

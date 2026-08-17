@@ -117,7 +117,13 @@ def main() -> None:
         "run_id": None,
     }
     with (
-        patch("app.agents.specialists.get_llm", return_value=object()),
+        patch(
+            "app.agents.specialists.get_routed_llm",
+            return_value=(
+                object(),
+                SimpleNamespace(model_tier="main", model_name="GigaChat-2"),
+            ),
+        ),
         patch(
             "app.agents.specialists.agent_traces.invoke_llm",
             return_value=AIMessage(content="grounded answer"),

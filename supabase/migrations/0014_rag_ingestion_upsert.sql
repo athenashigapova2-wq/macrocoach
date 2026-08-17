@@ -3,7 +3,7 @@
 -- transaction, even though Python validates the ingestion bundle first.
 
 create index if not exists knowledge_chunks_embedding_hnsw_idx
-  on public.knowledge_chunks using hnsw (embedding vector_cosine_ops)
+  on public.knowledge_chunks using hnsw (embedding extensions.vector_cosine_ops)
   where embedding is not null;
 
 create or replace function public.upsert_knowledge_document(
@@ -149,7 +149,7 @@ begin
     item->>'content_hash',
     (item->>'token_count')::integer,
     item->>'embedding_model',
-    (item->>'embedding')::vector(768),
+    (item->>'embedding')::extensions.vector(768),
     coalesce(item->'metadata', '{}'::jsonb)
   from jsonb_array_elements(p_chunks) item;
 

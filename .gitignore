@@ -44,3 +44,5 @@ __pycache__/
 .pytest_cache/
 !.env.example
 backend/data/
+# Supabase CLI local state
+supabase/.temp/

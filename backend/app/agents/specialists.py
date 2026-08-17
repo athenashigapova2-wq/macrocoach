@@ -14,9 +14,10 @@ from app.agents.prompts import (
     localized_system_prompt,
 )
 from app.agents.state import AgentState
-from app.llm import get_llm
+from app.llm import get_routed_llm
+from app.resilience import retry_transient
 from app.services import agent_traces
-from app.tools.registry import build_tools
+from app.tools.registry import build_tools, is_read_only_tool
 
 MAX_TOOL_STEPS = 6
 
@@ -52,8 +53,16 @@ def _invoke_tool(
             )
         return {"status": "error", "message": str(error)}
 
-    if run_id is None:
+    def invoke() -> Any:
+        if is_read_only_tool(tool):
+            return retry_transient(
+                lambda: tool.invoke(call["args"]),
+                operation_name=f"tool.{tool.name}",
+            )
         return tool.invoke(call["args"])
+
+    if run_id is None:
+        return invoke()
 
     tool_call_id = agent_traces.create_tool_call(
         run_id=run_id,
@@ -63,7 +72,7 @@ def _invoke_tool(
     )
     started_at = perf_counter()
     try:
-        result = tool.invoke(call["args"])
+        result = invoke()
     except Exception as exc:
         agent_traces.fail_tool_call(
             tool_call_id=tool_call_id,
@@ -84,7 +93,12 @@ def _invoke_tool(
 
 def _invoke_tool_agent(state: AgentState, system_prompt: str, tools: list[BaseTool]) -> dict:
     tools_by_name = {tool.name: tool for tool in tools}
-    llm = get_llm().bind_tools(tools, tool_choice="auto") if tools else get_llm()
+    base_llm, selection = get_routed_llm(
+        node_name=state["route"],
+        purpose="tool_planning_or_answer",
+        default_tier="main",
+    )
+    llm = base_llm.bind_tools(tools, tool_choice="auto") if tools else base_llm
     localized_prompt = localized_system_prompt(system_prompt, state["locale"])
     messages = [
         SystemMessage(content=localized_prompt),
@@ -99,7 +113,8 @@ def _invoke_tool_agent(state: AgentState, system_prompt: str, tools: list[BaseTo
             run_id=state.get("run_id"),
             node_name=state["route"],
             purpose="tool_planning_or_answer",
-            model_tier="main",
+            model_tier=selection.model_tier,
+            model_selection=selection,
         )
         messages.append(ai_msg)
         if not getattr(ai_msg, "tool_calls", None):
@@ -129,12 +144,18 @@ def recovery_node(state: AgentState) -> dict:
 
 def general_node(state: AgentState) -> dict:
     prompt = localized_system_prompt(GENERAL_SYSTEM, state["locale"])
+    llm, selection = get_routed_llm(
+        node_name="general",
+        purpose="answer",
+        default_tier="main",
+    )
     response = agent_traces.invoke_llm(
-        get_llm(),
+        llm,
         [SystemMessage(content=prompt), *_rag_messages(state), *state["messages"]],
         run_id=state.get("run_id"),
         node_name="general",
         purpose="answer",
-        model_tier="main",
+        model_tier=selection.model_tier,
+        model_selection=selection,
     )
     return {"messages": [response], "resolution_mode": "main_llm"}
