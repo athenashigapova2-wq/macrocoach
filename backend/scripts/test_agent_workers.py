@@ -65,13 +65,18 @@ def check_worker_task() -> None:
         patch("app.workers.tasks.mark_job_failed") as failed,
         patch("app.workers.tasks.logger.exception"),
     ):
-        run_agent_chat_task.run(
-            job_id="failed-job-id",
-            user_id="user-id",
-            message="Hello",
-            locale="en",
-            conversation_id=None,
-        )
+        try:
+            run_agent_chat_task.run(
+                job_id="failed-job-id",
+                user_id="user-id",
+                message="Hello",
+                locale="en",
+                conversation_id=None,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "offline"
+        else:
+            raise AssertionError("A failed worker task must remain failed in Celery")
     failed.assert_called_once_with("failed-job-id", "Агент временно недоступен")
 
 

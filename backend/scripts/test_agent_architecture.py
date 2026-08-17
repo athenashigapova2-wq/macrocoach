@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agents.router import route_with_keywords  # noqa: E402
 from app.agents.prompts import localized_system_prompt  # noqa: E402
-from app.tools.registry import build_tools  # noqa: E402
+from app.tools.registry import READ_ONLY_TOOL_NAMES, build_tools, is_read_only_tool  # noqa: E402
 from langchain_core.utils.function_calling import convert_to_openai_tool  # noqa: E402
 
 USER_ID = "00000000-0000-0000-0000-000000000000"
@@ -39,6 +39,12 @@ def assert_tool_boundaries() -> None:
     assert {"get_my_profile", "get_workout_history", "log_workout"} <= workout.keys()
     assert "log_meal" not in workout
     assert {"get_my_profile", "get_recovery_logs", "get_weight_trend", "get_cycle_logs"} <= recovery.keys()
+
+    all_tools = {**nutrition, **workout, **recovery}
+    for name in READ_ONLY_TOOL_NAMES:
+        assert is_read_only_tool(all_tools[name]), f"{name} must be explicitly read-only"
+    assert not is_read_only_tool(nutrition["log_meal"])
+    assert not is_read_only_tool(workout["log_workout"])
 
     for tools in (nutrition, workout, recovery):
         for tool in tools.values():

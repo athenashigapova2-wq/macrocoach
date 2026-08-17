@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -16,8 +17,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM provider
-    llm_provider: str = "gigachat"
+    # GigaChat models
     llm_router_model: str = ""
     agent_baseline_version: str = "baseline-v1"
 
@@ -26,9 +26,11 @@ class Settings(BaseSettings):
     gigachat_scope: str = "GIGACHAT_API_PERS"
     gigachat_model: str = "GigaChat-2"
 
-    # Anthropic
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-3-5-sonnet-latest"
+    # Retries are used only around idempotent LLM and read operations.
+    safe_retry_max_attempts: int = Field(default=3, ge=1, le=10)
+    safe_retry_base_delay_seconds: float = Field(default=0.5, ge=0.0, le=60.0)
+    safe_retry_max_delay_seconds: float = Field(default=4.0, ge=0.0, le=120.0)
+    safe_retry_jitter_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
 
     # Supabase
     supabase_url: str = ""

@@ -15,8 +15,9 @@ from app.agents.prompts import (
 )
 from app.agents.state import AgentState
 from app.llm import get_llm
+from app.resilience import retry_transient
 from app.services import agent_traces
-from app.tools.registry import build_tools
+from app.tools.registry import build_tools, is_read_only_tool
 
 MAX_TOOL_STEPS = 6
 
@@ -52,8 +53,16 @@ def _invoke_tool(
             )
         return {"status": "error", "message": str(error)}
 
-    if run_id is None:
+    def invoke() -> Any:
+        if is_read_only_tool(tool):
+            return retry_transient(
+                lambda: tool.invoke(call["args"]),
+                operation_name=f"tool.{tool.name}",
+            )
         return tool.invoke(call["args"])
+
+    if run_id is None:
+        return invoke()
 
     tool_call_id = agent_traces.create_tool_call(
         run_id=run_id,
@@ -63,7 +72,7 @@ def _invoke_tool(
     )
     started_at = perf_counter()
     try:
-        result = tool.invoke(call["args"])
+        result = invoke()
     except Exception as exc:
         agent_traces.fail_tool_call(
             tool_call_id=tool_call_id,

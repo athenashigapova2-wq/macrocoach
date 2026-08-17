@@ -17,6 +17,22 @@ from app.tools import recovery as recovery_tools
 from app.tools import workout as workout_tools
 
 ToolDomain = str
+READ_ONLY_TOOL_NAMES = frozenset(
+    {
+        "get_my_profile",
+        "search_food",
+        "get_daily_intake",
+        "get_workout_history",
+        "get_recovery_logs",
+        "get_weight_trend",
+        "get_cycle_logs",
+    }
+)
+
+
+def is_read_only_tool(tool: StructuredTool) -> bool:
+    """Use explicit metadata; unknown tools default to non-retryable writes."""
+    return bool((tool.metadata or {}).get("read_only", False))
 
 
 class WorkoutExerciseInput(BaseModel):
@@ -98,6 +114,7 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
         tools.append(StructuredTool.from_function(
             func=get_my_profile,
             name="get_my_profile",
+            metadata={"read_only": True},
             description=(
                 "Профиль пользователя: возраст, пол, рост, вес, цель, "
                 "целевые калории и БЖУ, аллергии, предпочтения. "
@@ -110,6 +127,7 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
             StructuredTool.from_function(
                 func=search_food,
                 name="search_food",
+                metadata={"read_only": True},
                 description=(
                     "Ищет продукт в справочнике и возвращает его КБЖУ на 100 г. "
                     "Аргумент query — название продукта, например 'куриная грудка'."
@@ -118,6 +136,7 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
             StructuredTool.from_function(
                 func=get_daily_intake,
                 name="get_daily_intake",
+                metadata={"read_only": True},
                 description=(
                     "Показывает, что пользователь УЖЕ съел за день: суммы КБЖУ "
                     "и список приёмов пищи. day — ГГГГ-ММ-ДД, по умолчанию сегодня."
@@ -126,6 +145,7 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
             StructuredTool.from_function(
                 func=log_meal,
                 name="log_meal",
+                metadata={"read_only": False},
                 description=(
                     "ЗАПИСЫВАЕТ приём пищи в дневник. Вызывай только когда "
                     "пользователь явно просит записать съеденное. "
@@ -139,11 +159,13 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
             StructuredTool.from_function(
                 func=get_workout_history,
                 name="get_workout_history",
+                metadata={"read_only": True},
                 description="История тренировок пользователя за последние days дней для прогрессии и нагрузки.",
             ),
             StructuredTool.from_function(
                 func=log_workout,
                 name="log_workout",
+                metadata={"read_only": False},
                 description=(
                     "ЗАПИСЫВАЕТ тренировку. Вызывай только после явной просьбы пользователя. "
                     "workout_type: upper_body, lower_body, full_body, functional, crossfit, cardio или rest."
@@ -156,11 +178,13 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
             StructuredTool.from_function(
                 func=get_recovery_logs,
                 name="get_recovery_logs",
+                metadata={"read_only": True},
                 description="Сон, энергия, настроение и симптомы за последние days дней.",
             ),
             StructuredTool.from_function(
                 func=get_weight_trend,
                 name="get_weight_trend",
+                metadata={"read_only": True},
                 description="Записи веса за последние days дней и изменение веса за период.",
             ),
         ])
@@ -169,6 +193,7 @@ def build_tools(user_id: str, domains: Iterable[ToolDomain] | None = None) -> li
         tools.append(StructuredTool.from_function(
             func=get_cycle_logs,
             name="get_cycle_logs",
+            metadata={"read_only": True},
             description="Opt-in записи цикла за последние days дней для recovery/cycle-aware советов.",
         ))
 

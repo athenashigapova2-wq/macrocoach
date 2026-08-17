@@ -2,7 +2,7 @@ import { supabase } from '@/api/supabaseClient';
 
 /**
  * Drop-in замена base44.integrations.Core.InvokeLLM({ prompt, response_json_schema }).
- * Вызывает Edge Function 'invoke-llm', которая держит ANTHROPIC_API_KEY на сервере.
+ * Вызывает Edge Function 'invoke-llm', которая держит ключ GigaChat на сервере.
  *
  * Раньше:  base44.integrations.Core.InvokeLLM({ prompt, response_json_schema })
  * Теперь:  invokeLLM({ prompt, response_json_schema })

@@ -5,14 +5,15 @@ from time import perf_counter
 from typing import Any
 
 from app.config import settings
+from app.resilience import retry_transient
 from app.services.supabase import get_supabase
+
+MODEL_PROVIDER = "gigachat"
 
 
 def _model_name(model_tier: str = "main") -> str:
     if model_tier == "small" and settings.llm_router_model:
         return settings.llm_router_model
-    if settings.llm_provider.lower() == "anthropic":
-        return settings.anthropic_model
     return settings.gigachat_model
 
 
@@ -38,7 +39,7 @@ def create_agent_run(
             {
                 "user_id": user_id,
                 "route": "general",
-                "model_provider": settings.llm_provider,
+                "model_provider": MODEL_PROVIDER,
                 "model_name": _model_name(),
                 "input_text": input_text,
                 "conversation_id": conversation_id,
@@ -138,7 +139,7 @@ def create_llm_call(
                 "run_id": run_id,
                 "node_name": node_name,
                 "purpose": purpose,
-                "model_provider": settings.llm_provider,
+                "model_provider": MODEL_PROVIDER,
                 "model_name": _model_name(model_tier),
                 "model_tier": model_tier,
                 "status": "started",
@@ -219,12 +220,16 @@ def invoke_llm(
     model_tier: str,
 ) -> Any:
     """Invoke an LLM and persist its lifecycle when a traced run is available."""
+    invoke = lambda: retry_transient(
+        lambda: llm.invoke(messages),
+        operation_name=f"llm.{node_name}.{purpose}",
+    )
     if run_id is None:
-        return llm.invoke(messages)
+        return invoke()
     llm_call_id = create_llm_call(run_id, node_name, purpose, model_tier)
     started_at = perf_counter()
     try:
-        message = llm.invoke(messages)
+        message = invoke()
     except Exception as exc:
         fail_llm_call(llm_call_id, run_id, exc, elapsed_ms(started_at))
         raise

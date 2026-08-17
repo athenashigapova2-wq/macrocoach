@@ -36,11 +36,8 @@ def readiness() -> dict[str, str | list[str]]:
     required_settings = {
         "SUPABASE_URL": settings.supabase_url,
         "SUPABASE_SERVICE_ROLE_KEY": settings.supabase_service_role_key,
+        "GIGACHAT_AUTH_KEY": settings.gigachat_auth_key,
     }
-    if settings.llm_provider.lower() == "anthropic":
-        required_settings["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-    else:
-        required_settings["GIGACHAT_AUTH_KEY"] = settings.gigachat_auth_key
     missing = [name for name, value in required_settings.items() if not value]
     redis_ready = redis_is_ready()
     return {

@@ -29,6 +29,7 @@ def main() -> None:
         assert insert_payload["user_id"] == "user-id"
         assert insert_payload["status"] == "started"
         assert insert_payload["input_text"] == "Что я сегодня съела?"
+        assert insert_payload["model_provider"] == "gigachat"
         assert insert_payload["baseline_version"] == "baseline-v1"
         assert insert_payload["resolution_mode"] == "main_llm"
 
@@ -100,6 +101,7 @@ def main() -> None:
         llm_insert = query.insert.call_args.args[0]
         assert llm_insert["node_name"] == "router"
         assert llm_insert["model_tier"] == "small"
+        assert llm_insert["model_provider"] == "gigachat"
 
         query.eq.reset_mock()
         agent_traces.succeed_llm_call(

@@ -1,352 +1,144 @@
 # Athena AI
 
-Мобильное приложение для управления питанием и тренировками с AI-агентом.
-Android (Capacitor + React), Python-бэкенд с агентной архитектурой, Supabase (PostgreSQL).
+Athena AI — мобильное приложение для питания, тренировок и восстановления с
+персональным AI-агентом. Интерфейс построен на React и Capacitor, серверная часть —
+на FastAPI, LangGraph, Redis и Celery. Единственная облачная LLM проекта — GigaChat.
 
-Поддерживаемые языки интерфейса и запросов: русский, английский, французский,
-испанский, китайский.
-
----
+Поддерживаемые языки: русский, английский, французский, испанский и китайский.
 
 ## Возможности
 
-| Раздел | Функциональность |
-|---|---|
-| Онбординг | Расчёт базовой калорийности и БЖУ по параметрам тела, уровню активности и цели (мягкое/резкое похудение, рекомпозиция, поддержание, набор массы) |
-| Дневник питания | Запись приёмов пищи со справочником на 2210 продуктов, суммы КБЖУ за день |
-| Тренировки | Генерация программ по группам мышц и уровню сложности; комплексы для зала, дома и улицы |
-| Чат с агентом | Консультации с доступом к данным пользователя через tool calling |
-| Список покупок | Формирование списка продуктов под предложенные блюда |
-| Личный кабинет | Профиль, динамика веса, отслеживание цикла |
-
----
+- онбординг и расчёт целевых калорий и БЖУ;
+- дневник питания и семантический поиск по справочнику продуктов;
+- история и запись тренировок;
+- данные сна, энергии, веса и цикла;
+- AI-чат с маршрутизацией по specialist-агентам;
+- RAG по проверенной базе знаний с каноническими ссылками;
+- трассировка LLM/tool calls и offline-eval сценарии на пяти языках.
 
 ## Архитектура
 
-```
-Android (React + Capacitor)
-        |  HTTPS + Supabase JWT
-        v
-Python-бэкенд (FastAPI)
-        |
-        +-- LangGraph: маршрутизация и цикл вызова инструментов
-        +-- Инструменты -> Supabase (scoped по user_id из токена)
-        +-- LLM-провайдер (GigaChat): диалог, tool calling, перевод запросов
-        +-- Локальная модель эмбеддингов: семантический поиск по справочнику
-```
-
-**Клиент:** React, Vite, Capacitor, Tailwind
-**Бэкенд:** Python 3.11, FastAPI, LangChain, LangGraph, pydantic-settings
-**Данные:** Supabase (PostgreSQL, pgvector, Row Level Security)
-**Модели:** GigaChat через LangChain, multilingual-e5-base (эмбеддинги, локально).
-Anthropic оставлен в коде только как необязательный альтернативный провайдер и
-для обычного запуска не требуется.
-
-### Agent architecture v1
-
-Бэкенд перешёл от одного AI-чата к первому LangGraph-графу:
-
-```
-User message
-    -> Router Agent
-        -> Nutrition Agent: профиль, поиск продуктов, дневник, запись еды
-        -> Workout Agent: профиль, история тренировок, запись тренировки
-        -> Recovery Agent: профиль, сон/энергия/симптомы, вес, цикл
-        -> General Agent: общие ответы и уточнения
+```text
+React / Vite / Capacitor
+        │ Supabase JWT
+        ▼
+FastAPI :8001
+        │ создаёт job
+        ▼
+Redis :6379 ─────► Celery worker
+  │                    │
+  │ status/result      ├─ LangGraph router
+  │                    ├─ RAG retriever
+  └────────────────────┼─ Nutrition / Workout / Recovery / General
+                       ├─ GigaChat
+                       └─ Supabase PostgreSQL + pgvector
 ```
 
-Каждый specialist-agent получает только свой набор инструментов. Например,
-Nutrition Agent не видит `log_workout`, а Workout Agent не видит `log_meal`.
-Это уменьшает риск ошибочного tool calling и делает поведение проще измерять.
-`Router Agent` сначала пробует LLM-классификацию, а при недоступности модели
-откатывается на детерминированные ключевые слова, поэтому локальные offline-тесты
-проверяют маршрутизацию без внешних API.
-
-### FastAPI boundary
-
-Мобильный клиент не обращается к LangGraph или Supabase `service_role` напрямую.
-Он отправляет `POST /api/v1/agent/chat` с Supabase access token в заголовке
-`Authorization: Bearer ...`. FastAPI проверяет подпись и срок действия JWT,
-извлекает доверенный `user_id` из поля `sub` и только после этого запускает граф.
-Таким образом, `user_id` никогда не принимается из JSON-запроса клиента.
-
-Локальный запуск из каталога `backend`:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-Проверка без реальных вызовов LLM и Supabase:
-
-```bash
-python scripts/test_fastapi.py
-```
-
-Следующий слой production-наблюдаемости хранится в Supabase: `agent_runs`
-фиксирует каждый ответ агента, `agent_tool_calls` — вызовы инструментов внутри
-run, `agent_feedback` — пользовательскую оценку ответа. Эти таблицы нужны для
-отладки, evaluation и будущего admin analytics dashboard.
-
-FastAPI создаёт `agent_runs` перед запуском графа и завершает запись статусом
-`succeeded` или `failed`. В run сохраняются выбранный specialist, модель и
-latency. Обновления всегда фильтруются одновременно по `id` и `user_id`, потому
-что серверный Supabase-клиент использует `service_role` и обходит RLS.
-
-Каждый вызов инструмента связан с родительским run через `run_id`. Для него
-сохраняются имя, аргументы, структурированный результат, status и latency;
-ошибочные и даже неизвестные вызовы модели получают статус `failed`.
-
-Миграция `0013_agent_efficiency_metrics.sql` добавляет отдельный trace каждого
-вызова модели в `agent_llm_calls`: node/purpose, small или main model tier,
-input/output/cache tokens, total tokens, status и latency. Триггеры агрегируют
-LLM calls, tokens, tool calls и tool steps в `agent_runs`. `resolution_mode`
-различает `zero_llm`, `small_llm`, `main_llm` и `fallback`, а
-`AGENT_BASELINE_VERSION` связывает production-метрики с одной зафиксированной
-версией baseline. Значение нужно менять только при сознательном создании нового
-baseline после полного regression-eval, а не при каждом deploy.
-`LLM_ROUTER_MODEL` может указывать отдельную small-модель; пустое значение
-сохраняет текущую основную модель и не считается выполнением small-model KPI.
-`token_accounted_call_count` позволяет отличить настоящий нулевой расход от
-вызова, для которого провайдер не вернул token usage.
-
-### Agent evals
-
-Первый regression dataset содержит 40 размеченных запросов на пяти языках.
-Offline-eval измеряет exact-match accuracy детерминированного Router fallback и
-проверяет, что выбранный specialist имеет доступ к требуемому инструменту:
-
-```bash
-python backend/scripts/eval_agents.py
-```
-
-Порог по умолчанию — 100%: изменение ключевых слов или границ инструментов не
-может незаметно сломать уже размеченные сценарии. Этот eval не оценивает качество
-текста LLM; для него будет отдельный live-набор с зафиксированным judge rubric.
-
-Tool-selection dataset отдельно проверяет read/write-инструменты на пяти языках.
-По умолчанию скрипт только валидирует разметку и границы, не обращаясь к модели:
-
-```bash
-python backend/scripts/eval_tool_selection.py
-```
-
-Live-режим проверяет до четырёх последовательных решений модели на case. Read-tools
-получают фиктивные результаты, а **реальные инструменты не выполняются**, поэтому
-eval не пишет тестовую еду или тренировки в БД:
-
-```bash
-python backend/scripts/eval_tool_selection.py --live
-```
-
-Live-eval читает `LLM_PROVIDER` и ключ провайдера из `backend/.env` независимо
-от того, запущена команда из корня репозитория или из каталога `backend`.
-
-Write-safety dataset проверяет явное согласие, отрицание записи и запрет write-tools
-для информационных запросов. Answer-quality dataset проверяет grounded числа,
-отсутствие внутренних имён и медицинскую эскалацию на пяти языках:
-
-```bash
-python backend/scripts/eval_write_safety.py
-python backend/scripts/eval_write_safety.py --live
-python backend/scripts/eval_answer_quality.py
-python backend/scripts/eval_answer_quality.py --live
-```
+В Docker запускаются три сервиса:
 
-Оба live-eval используют только фиктивные результаты инструментов и не изменяют БД.
-Write-safety оценивает только разрешение на запись; выбор read-tool отдельно
-измеряется tool-selection eval. Язык ответа задаётся API locale как явный system
-contract, а не определяется моделью только по тексту сообщения.
-Для экстренных симптомов Recovery Agent обязан отвечать немедленно и не задерживать
-рекомендацию вызовами профиля, истории, веса или календаря.
+| Сервис | Назначение |
+|---|---|
+| `api` | FastAPI, JWT boundary, постановка заданий и выдача статуса |
+| `redis` | Celery broker и краткоживущее хранилище job status/result |
+| `worker` | Выполнение LangGraph, GigaChat, RAG и инструментов |
 
----
+Frontend в локальной разработке запускается отдельно через Vite на порту `5175`.
 
-## Инженерные решения
+### Поток сообщения
 
-### RAG v1 ingestion boundary
+1. Frontend отправляет `POST /api/v1/agent/chat` с Supabase access token.
+2. FastAPI проверяет JWT, создаёт job в Redis и возвращает `202` с `job_id`.
+3. Celery worker получает задание из очереди `athena-agent`.
+4. Router выбирает `nutrition`, `workout`, `recovery` или `general`.
+5. Retriever добавляет релевантный RAG-контекст.
+6. Specialist вызывает GigaChat и доступные ему инструменты.
+7. Результат сохраняется в Redis и Supabase; frontend опрашивает job endpoint.
 
-The implemented runtime path is `router -> retriever -> specialist`. Approved knowledge is searched
-with multilingual E5 embeddings and injected with canonical citation URLs. Ingestion is available
-through `backend/scripts/ingest_knowledge.py`; the bundle format, idempotent upsert behavior and
-safety gates are documented in `backend/knowledge/README.md`.
+### Границы инструментов
 
-RAG хранит официальные документы отдельно от структурированного справочника еды:
-`knowledge_sources` управляет происхождением и правами, `knowledge_documents` —
-версиями документов, `knowledge_chunks` — citation-ready фрагментами и embeddings,
-`knowledge_ingestion_runs` — аудитом загрузок. Candidate sources по умолчанию
-запрещены к ingestion до ручной проверки URL, актуальности и условий повторного
-использования. Контракт и выборки описаны в `backend/knowledge/README.md`.
+`user_id` берётся только из проверенного JWT и замыкается внутри tool-функций. Он
+не входит в JSON Schema, которую видит модель. Каждый specialist получает только
+свой набор инструментов:
 
-### user_id недоступен модели
+- Nutrition: профиль, поиск еды, дневной рацион, запись еды;
+- Workout: профиль, история и запись тренировок;
+- Recovery: профиль, сон, энергия, вес и цикл;
+- General: ответ без записывающих инструментов.
 
-Инструменты агента собираются фабрикой под конкретного пользователя. `user_id`
-замыкается внутри функции и не попадает в JSON Schema, которую видит модель:
+`log_meal` и `log_workout` выполняются только после явной просьбы пользователя.
 
-```python
-def build_tools(user_id: str) -> list[StructuredTool]:
-    def get_my_profile() -> dict:
-        return profile_tools.get_profile(user_id)
-    ...
-```
+## Надёжность
 
-У инструмента нет параметра, в который можно подставить чужой идентификатор.
-Наивная сигнатура `get_profile(user_id: str)` открывала бы доступ к чужому
-дневнику через prompt injection в тексте запроса.
+### Безопасные retries
 
-Бэкенд работает под `service_role`, который обходит Row Level Security, поэтому
-каждый запрос обязан фильтровать по `user_id` явно — это зафиксировано в
-docstring модуля доступа к базе.
+Повторяются только идемпотентные операции:
 
-### Расчёты — детерминированные функции, не LLM
+- вызовы GigaChat;
+- чтение истории разговора;
+- RAG RPC;
+- инструменты, явно отмеченные `read_only`.
 
-BMR, TDEE, распределение макронутриентов и суммирование дневного рациона
-считаются в Python. Модель вызывает эти функции и объясняет результат, но не
-вычисляет сама. Приложение работает с калориями — цифры должны быть
-воспроизводимыми.
+По умолчанию выполняется до трёх попыток с exponential backoff `0.5s → 1s`,
+jitter до 25% и верхней границей задержки 4 секунды. Повторяемыми считаются
+network/timeout ошибки и HTTP `408`, `425`, `429`, `500`, `502`, `503`, `504`.
 
-### Сменные провайдеры
+Операции записи и Celery-задача целиком не повторяются: это предотвращает двойную
+запись еды или тренировки при неопределённом результате сетевого запроса.
 
-Слой доступа к модели возвращает абстракцию `BaseChatModel`, слой эмбеддингов —
-`Embeddings`. Благодаря этому переход с облачных эмбеддингов на локальные (после
-того, как выяснилось, что эндпоинт `/embeddings` не входит в используемый тариф)
-затронул один файл и не коснулся инструментов и агентов.
+### Embedding model
 
----
+Worker до перехода в `ready` загружает локальную модель
+`intfloat/multilingual-e5-base`. Файлы сохраняются в Docker volume `hf-cache`,
+поэтому пересоздание контейнера не требует повторного скачивания. Инициализация
+защищена lock и выполняется один раз при четырёх worker threads.
 
-## Качество данных
+### Health checks
 
-Справочник построен на Food Nutrition Dataset (Kaggle). При первичном импорте
-257 записей из 2395 содержали физически невозможные значения — до 6077 ккал
-на 100 г при теоретическом максимуме 900 (чистый жир, 9 ккал/г).
+- `/health` — процесс FastAPI работает;
+- `/health/ready` — заданы обязательные настройки и доступен Redis;
+- worker healthcheck — Celery отвечает на `inspect ping`;
+- Redis healthcheck — `redis-cli ping`.
 
-**Причина.** Документация датасета утверждает, что значения даны на 100 г. Данные
-это опровергают: лишь 1.6% строк имеют сумму состава (жир + углеводы + белок +
-вода + клетчатка) около 100 г. Фактически значения приведены **на порцию**,
-размер которой у каждого продукта свой и в файле не указан.
+## Стек
 
-**Восстановление.** Вес порции вычисляется как сумма массовых колонок. Проверка
-на продуктах с известной калорийностью:
+**Frontend:** React, Vite, Tailwind CSS, Capacitor, Supabase JS.
 
-| Продукт | В файле | Вес порции | После пересчёта | Справочное значение |
-|---|---|---|---|---|
-| olive oil | 119 | 13.5 г | 881 | 884 |
-| banana | 134 | 152.7 г | 88 | 89 |
-| white rice raw | 675 | 186.2 г | 363 | 365 |
-| goose meat raw | 6077 | 1624 г | 374 | 371 |
+**Backend:** Python 3.11, FastAPI, LangChain Core, LangGraph, GigaChat, Celery.
 
-`backend/scripts/import_food_data.py` выполняет пересчёт, отбраковывает 185
-невосстановимых записей (отсутствует состав), печатает контрольные значения
-перед записью и поддерживает режим `--dry-run`.
+**Data:** Supabase PostgreSQL, pgvector, Row Level Security, Redis.
 
-Результат: 2210 корректных записей, ноль физически невозможных значений.
+**ML:** GigaChat и локальная `multilingual-e5-base` для embeddings.
 
----
+## Требования
 
-## Семантический поиск
+- Node.js 20+ и npm;
+- Python 3.11;
+- Docker Desktop с Linux Engine;
+- проект Supabase;
+- GigaChat Authorization key.
 
-Приложение принимает запросы на пяти языках, справочник — англоязычный.
-Подстрочный и триграммный поиск эту задачу не решают: «курица» не находит
-`chicken` ни при каких настройках.
+## Настройка окружения
 
-### Измерение
-
-Набор из 30 размеченных вручную запросов на пяти языках
-(`backend/evals/search_cases.json`). Метрика — **Recall@5**: доля запросов, для
-которых корректный продукт попал в топ-5.
-
-Выбор @5, а не @1, продиктован архитектурой: инструмент возвращает агенту пять
-кандидатов, финальный выбор по названию делает LLM.
-
-| Подход | Recall@1 | Recall@5 |
-|---|---|---|
-| pg_trgm (поиск по буквенным фрагментам) | 13% | 13% |
-| multilingual-e5-small (384d) | 23% | 30% |
-| multilingual-e5-base (768d) | 13% | 37% |
-| + перевод запроса на английский | 40% | 77% |
-| + приоритет базовых продуктов | **63%** | **93%** |
-
-### Что показали измерения
-
-**Триграммы дают Recall@1 = Recall@5.** Если правильный ответ не оказался первым,
-его нет и в пятёрке: поиск по буквам либо угадывает написание, либо нет.
-
-**Увеличение модели эмбеддингов не решило задачу.** Переход с 384 на 768
-измерений поднял Recall@5 с 30% до 37%, но Recall@1 при этом упал. Анализ
-промахов показал причину: на кириллице и иероглифах модель сопоставляла
-созвучие начала слова, а не смысл — «творог» → `witloof chicory`, «лосось» →
-`couscous dry`, «гречка» → `greek yogurt`. Латиница обрабатывалась корректно.
-
-**Узким местом была межъязыковая связка, а не сам поиск.** Предварительный
-перевод запроса на английский поднял Recall@5 с 37% до 77% без смены модели
-эмбеддингов. Перевод выполняется тем же LLM, что и диалог; при недоступности
-модели поиск откатывается на исходный запрос.
-
-**Ранжирование потребовало доменного знания.** Оставшиеся промахи были
-однотипны: на запрос «курица» выдавались `chicken spread`, `chicken stock`,
-`chicken broth` — переработанные продукты вместо ингредиента. Небольшой бонус
-к близости для названий с признаками базового продукта (`raw`, `cooked`, `meat`)
-поднял Recall@5 до 93% и Recall@1 с 40% до 63%.
-
-**Известное ограничение.** Единственный оставшийся промах — китайский запрос
-三文鱼 (лосось), который LLM переводит как `Shellfish`. Ограничение
-переводческих способностей модели на китайском.
-
-### Об индексах
-
-Индекс `ivfflat` на 2210 векторах удалён: приближённый поиск просматривает по
-умолчанию один кластер из 47 и пропускает релевантные результаты, тогда как
-полный перебор при 768 измерениях занимает единицы миллисекунд. Индекс
-(предпочтительно `hnsw`) имеет смысл при росте справочника на порядки.
-
-### Ограничения методики
-
-Приоритет базовых продуктов настраивался по промахам на том же наборе, на
-котором измерялось качество. Валидация на отложенной выборке запросов —
-в планах.
-
----
-
-## Безопасность
-
-- Ключи LLM-провайдера и `service_role` Supabase существуют только на сервере.
-  Переменные с префиксом `VITE_` попадают в JS-бандл и внутрь APK, поэтому
-  клиенту доступны исключительно публичный `anon`-ключ и адрес бэкенда.
-- Row Level Security включён на всех пользовательских таблицах; политики
-  построены на `auth.uid() = user_id`.
-- Ассистентские сообщения в `agent_messages` пишет только `service_role`;
-  пользователь ограничен вставкой собственных сообщений с `role = 'user'`.
-- Keystore для подписи APK хранится вне репозитория; на GitHub включены
-  secret scanning и push protection.
-
----
-
-## Запуск
-
-### База данных Supabase
-
-SQL-файлы в `supabase/migrations/` — это схема базы данных проекта. Они нужны и
-должны храниться в репозитории. Миграции применяются строго по порядку имени —
-с `0001_init.sql` по последнюю доступную миграцию.
-
-Предпочтительный способ через Supabase CLI:
+### Frontend
 
 ```powershell
-npx supabase login
-npx supabase link --project-ref <project-ref>
-npx supabase db push
+Copy-Item ".\.env.example" ".\.env"
+npm install
 ```
 
-Если CLI не используется, выполните все файлы из `supabase/migrations/` по
-порядку в **Supabase Dashboard → SQL Editor**. Не ограничивайтесь файлами
-`0001`–`0003`: более поздние миграции добавляют поиск, RAG, наблюдаемость агента
-и другие части текущей схемы.
+Заполните корневой `.env`:
 
-`MIGRATION.md` — историческая памятка о переходе с Base44. Для запуска приложения
-она не требуется; актуальная инструкция находится в этом README.
+```env
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
+VITE_AGENT_API_URL=https://your-production-api.example.com
+AGENT_PROXY_TARGET=http://127.0.0.1:8001
+```
 
-### Бэкенд
+`VITE_`-переменные попадают в клиентский bundle. Никогда не помещайте туда
+`service_role` или GigaChat Authorization key.
 
-Команды ниже выполняются из корня репозитория. Для первого запуска в PowerShell:
+### Backend
 
 ```powershell
 python -m venv .venv
@@ -355,257 +147,209 @@ python -m pip install -r ".\backend\requirements.txt"
 Copy-Item ".\backend\.env.example" ".\backend\.env"
 ```
 
-Заполните `backend/.env` своими значениями. Список переменных окружения и
-пояснения к ним находятся в `backend/.env.example`.
+Минимальная конфигурация `backend/.env`:
 
-По умолчанию используется `LLM_PROVIDER=gigachat`, поэтому нужен
-`GIGACHAT_AUTH_KEY`. `ANTHROPIC_API_KEY` оставьте пустым: он требуется только при
-явном переключении на `LLM_PROVIDER=anthropic`.
+```env
+GIGACHAT_AUTH_KEY=
+GIGACHAT_SCOPE=GIGACHAT_API_PERS
+GIGACHAT_MODEL=GigaChat-2
+LLM_ROUTER_MODEL=
 
-Запустите API на порту `8001`:
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_JWT_SECRET=
+SUPABASE_JWT_AUDIENCE=authenticated
 
-```powershell
-& ".\.venv\Scripts\Activate.ps1"
-python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8001
+API_CORS_ORIGINS=http://localhost:5175,http://127.0.0.1:5175
+REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
-Chat выполняется через Redis и Celery workers. Полная инструкция запуска очереди,
-API и workers находится в [`backend/WORKERS.md`](backend/WORKERS.md).
+`SUPABASE_JWT_SECRET` нужен только проектам с legacy HS256-токенами. Для
+RS256/ES256 backend получает публичные ключи из Supabase JWKS.
 
-После запуска проверьте:
+Дополнительные настройки retries и RAG перечислены в
+[`backend/.env.example`](backend/.env.example).
+
+## Supabase migrations
+
+Примените миграции из `supabase/migrations/` строго по имени:
+
+```powershell
+npx supabase login
+npx supabase link --project-ref <project-ref>
+npx supabase db push
+```
+
+Если Supabase CLI не используется, выполните все миграции по порядку через
+Dashboard → SQL Editor.
+
+## Запуск через Docker Compose
+
+Рекомендуемый способ запуска backend:
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+Ожидаемый результат:
 
 ```text
-http://127.0.0.1:8001/health
-http://127.0.0.1:8001/health/ready
+athenaai-api-1      healthy
+athenaai-redis-1    healthy
+athenaai-worker-1   healthy
 ```
 
-Readiness должен вернуть `{"status":"ready","missing":[]}`. Если статус
-`not_ready`, заполните перечисленные переменные в `backend/.env` и перезапустите
-Uvicorn.
-
-Проверка связи с моделью и базой:
-
-```bash
-python scripts/smoke_test.py
-python scripts/test_profile.py
-python scripts/test_agent_tools.py
-```
-
-### Справочник продуктов
-
-Датасет в репозитории не хранится. Скачать
-[Food Nutrition Dataset](https://www.kaggle.com/datasets/utsavdey1410/food-nutrition-dataset),
-распаковать `FOOD-DATA-GROUP*.csv` в `backend/data/kaggle/`, затем:
-
-```bash
-python scripts/import_food_data.py --csv-dir data/kaggle --dry-run
-python scripts/import_food_data.py --csv-dir data/kaggle
-python scripts/build_embeddings.py
-```
-
-### Замер качества поиска
-
-```bash
-python scripts/eval_search.py trigram
-python scripts/eval_search.py vector
-python scripts/eval_search.py translate
-```
-
-### Клиент
-
-Для первого запуска создайте корневой `.env` из примера и укажите данные того же
-Supabase-проекта, который задан в `backend/.env`:
+Проверка API:
 
 ```powershell
-Copy-Item ".\.env.example" ".\.env"
-npm install
+Invoke-RestMethod "http://127.0.0.1:8001/health"
+Invoke-RestMethod "http://127.0.0.1:8001/health/ready"
 ```
 
-В отдельном окне PowerShell запустите Vite. В локальной конфигурации проекта
-используется порт `5175`:
+Проверка worker:
+
+```powershell
+docker compose exec -T worker python -m celery `
+    -A app.workers.celery_app:celery_app `
+    inspect ping --timeout=5
+```
+
+Логи:
+
+```powershell
+docker compose logs -f api worker
+```
+
+Остановка без удаления данных:
+
+```powershell
+docker compose down
+```
+
+`docker compose down --volumes` удаляет очередь Redis и кэш embedding-модели;
+используйте команду только для намеренного полного сброса.
+
+Подробности ручного запуска Redis и Celery находятся в
+[`backend/WORKERS.md`](backend/WORKERS.md).
+
+## Запуск frontend
+
+В отдельном PowerShell:
 
 ```powershell
 npm run dev -- --host 127.0.0.1 --port 5175
 ```
 
-Откройте приложение и Chat:
+Откройте:
 
-```text
-http://127.0.0.1:5175/
-http://127.0.0.1:5175/chat
-```
+- приложение: <http://127.0.0.1:5175/>;
+- AI-чат: <http://127.0.0.1:5175/chat>;
+- readiness через Vite proxy: <http://127.0.0.1:5175/agent-api/health/ready>.
 
-Если `5175` занят, Vite может выбрать следующий свободный порт. В таком случае
-используйте адрес из строки `Local` в выводе Vite и подставьте этот порт во все
-локальные URL ниже.
+В dev-режиме Vite проксирует `/agent-api` на `127.0.0.1:8001`, поэтому локальный
+чат не зависит от CORS.
 
-Production-сборка и синхронизация Android:
+## Проверки
 
-```powershell
-npm run build
-npx cap sync android
-```
-
-### Подключение Chat к FastAPI
-
-Страница Chat вызывает `POST /api/v1/agent/chat`, а не Supabase
-Edge Function `chat-with-coach`. В frontend build environment укажите публичный
-HTTPS-адрес развёрнутого FastAPI без завершающего `/`:
-
-```env
-VITE_AGENT_API_URL=https://api.example.com
-```
-
-При локальном `npm run dev` frontend обращается к same-origin пути `/agent-api`,
-а Vite проксирует запросы в FastAPI на `127.0.0.1:8001`. Порт Vite (`5175` или
-другой свободный) на адрес backend не влияет. При необходимости задайте в
-корневом `.env` другой адрес API и перезапустите Vite:
-
-```env
-AGENT_PROXY_TARGET=http://127.0.0.1:8001
-```
-
-Так локальный Chat не зависит от CORS и не использует значение production-переменной
-`VITE_AGENT_API_URL`. Проверить proxy можно при работающих Vite и Uvicorn:
-
-```text
-http://127.0.0.1:5175/agent-api/health
-```
-
-Для проверки обязательных backend-настроек без вывода значений секретов откройте:
-
-```text
-http://127.0.0.1:5175/agent-api/health/ready
-```
-
-Ответ `not_ready` перечислит только имена отсутствующих переменных. Все значения
-нужно заполнить в `backend/.env`, после чего перезапустить Uvicorn.
-
-FastAPI принимает как legacy `HS256` access tokens, так и новые токены Supabase,
-подписанные `RS256`/`ES256`. Для asymmetric tokens публичный ключ автоматически
-берётся из `<SUPABASE_URL>/auth/v1/.well-known/jwks.json`; `SUPABASE_JWT_SECRET`
-нужен только проектам, которые всё ещё выпускают legacy `HS256` tokens.
-Если JWKS недоступен или в нём нет `kid` из заголовка токена, API возвращает
-JSON-ошибку `503`/`401`, а не безымянный `500`; сам access token в лог не пишется.
-
-При работе через `/agent-api` запрос same-origin, поэтому CORS не участвует.
-Если frontend обращается к FastAPI напрямую, добавьте его origin в backend
-environment, например:
-
-```env
-API_CORS_ORIGINS=https://macrocoach.example.com,http://localhost:5175,http://127.0.0.1:5175
-```
-
-Клиент берёт текущий Supabase access token и передаёт его как
-`Authorization: Bearer <token>`. FastAPI проверяет JWT, получает `user_id`
-только из токена, запускает LangGraph и сохраняет оба сообщения в
-`agent_messages`. После изменения `VITE_AGENT_API_URL` frontend нужно
-собрать и развернуть заново.
-
-Если Chat возвращает `401`, проверьте точный JSON в `Network -> Response`. Чаще
-всего frontend и backend используют разные Supabase-проекты либо браузер хранит
-старую сессию. Значения проекта в `VITE_SUPABASE_URL` и `SUPABASE_URL` должны
-совпадать; после исправления выйдите из аккаунта, очистите site data и войдите
-снова. Endpoint `/api/v1/agent/chat` принимает `POST`, поэтому его не проверяют
-простым открытием ссылки в браузере.
-
-### Если чат возвращает `GIGACHAT_AUTH_ERROR`
-
-Legacy Edge Functions всё ещё могут использовать GigaChat. Ответ GigaChat
-`credentials doesn't match db data` означает, что сохранённый в Supabase secret
-не совпадает с активным authorization key в кабинете GigaChat. Это не CORS и не
-ошибка кнопки отправки. Сгенерируйте новый ключ авторизации в том же API-проекте
-и сохраните **только Base64-значение**, без `Basic `, кавычек и имени переменной:
+Offline-проверки не обращаются к GigaChat и не изменяют Supabase:
 
 ```powershell
-npx supabase login
-npx supabase link --project-ref <your-project-ref>
-npx supabase secrets set GIGACHAT_AUTH_KEY="<authorization-key>"
-npx supabase functions deploy chat-with-coach
+python backend/scripts/test_fastapi.py
+python backend/scripts/test_agent_architecture.py
+python backend/scripts/test_agent_workers.py
+python backend/scripts/test_agent_traces.py
+python backend/scripts/test_retry_policy.py
+python backend/scripts/test_rag_retriever.py
 ```
 
-Проверить наличие имени секрета (значение команда не показывает):
+Evaluation datasets:
 
 ```powershell
-npx supabase secrets list
+python backend/scripts/eval_agents.py
+python backend/scripts/eval_tool_selection.py
+python backend/scripts/eval_write_safety.py
+python backend/scripts/eval_answer_quality.py
 ```
 
-Логи откройте в Supabase Dashboard: **Edge Functions → chat-with-coach → Logs**.
+Команды с `--live` выполняют реальные вызовы GigaChat, но используют фиктивные
+результаты инструментов и не должны записывать пользовательские данные.
 
-`GIGACHAT_AUTH_KEY` — это Authorization key из кабинета, а не 30-минутный
-Access token. Edge Function сама отправляет Authorization key по Basic-схеме на
-`POST https://ngw.devices.sberbank.ru:9443/api/v2/oauth`, кэширует полученный
-Access token и использует его по Bearer-схеме для `https://api.giga.chat/v1/*`.
-Перед записью секрета Authorization key можно безопасно проверить локально,
-не добавляя его в файл или историю Git:
+## RAG и справочник продуктов
+
+Runtime-путь RAG: `router → retriever → specialist`. Документация ingestion,
+лицензирования источников и формата bundles находится в
+[`backend/knowledge/README.md`](backend/knowledge/README.md).
+
+Основные команды:
 
 ```powershell
-$authKey = Read-Host "Paste GigaChat Authorization key"
-$token = Invoke-RestMethod `
-  -Method Post `
-  -Uri "https://ngw.devices.sberbank.ru:9443/api/v2/oauth" `
-  -Headers @{ Accept = "application/json"; RqUID = [guid]::NewGuid().ToString(); Authorization = "Basic $authKey" } `
-  -ContentType "application/x-www-form-urlencoded" `
-  -Body "scope=GIGACHAT_API_PERS"
-$token.expires_at
+python backend/scripts/ingest_knowledge.py --help
+python backend/scripts/import_food_data.py --csv-dir backend/data/kaggle --dry-run
+python backend/scripts/build_embeddings.py
 ```
 
-Не копируйте `$token.access_token` в Supabase: он действует около 30 минут.
-Если локальная OAuth-проверка возвращает code 6, создайте новый Authorization
-key в нужном GigaChat API-проекте и проверьте, что он предназначен для
-`GIGACHAT_API_PERS`.
+Справочник содержит 2210 нормализованных продуктов. Комбинация перевода запроса,
+multilingual embeddings и доменного ранжирования показала Recall@5 93% на
+внутреннем наборе из 30 запросов.
 
-Если этот ключ используют `estimate-meal`, `analyze-habits` и `invoke-llm`, после
-замены секрета повторно задеплойте и эти функции. Никогда не вставляйте ключ в
-frontend, скриншот, Git или сообщение об ошибке.
+## Безопасность
 
-Ошибка `No such model` означает, что OAuth уже прошёл, но отправленный model ID
-недоступен этому API-проекту. Получите список через `GET /v1/models`, скопируйте
-точный `id` и сохраните его в Supabase secret `GIGACHAT_MODEL`. Edge Functions
-используют этот secret; если он отсутствует, применяется `GigaChat-2`.
+- GigaChat key и Supabase `service_role` существуют только на backend;
+- frontend передаёт Supabase access token в `Authorization: Bearer ...`;
+- FastAPI получает `user_id` только из проверенного JWT;
+- пользовательские запросы Supabase фильтруются по доверенному `user_id`;
+- write-tools отделены от read-only tools и не получают автоматические retries;
+- access tokens и значения секретов не выводятся в readiness или логи.
 
-В Windows PowerShell 5.1 нет `Invoke-RestMethod -SkipCertificateCheck`. Вместо
-него используйте диагностический Python-скрипт: он скрыто запрашивает
-Authorization key, получает временный Access token, выводит доступные model ids
-и отправляет один тестовый запрос. При локальной ошибке российского TLS-root
-допустим `--insecure` только для этой диагностики:
+## Диагностика
+
+### Docker API недоступен
+
+Если отсутствует `dockerDesktopLinuxEngine`, запустите Docker Desktop и дождитесь
+`Engine running`, затем выполните `docker version`.
+
+### Порт 8001 занят
+
+```powershell
+Get-NetTCPConnection -LocalPort 8001 -State Listen
+```
+
+Остановите вручную запущенный Uvicorn перед публикацией порта Docker API.
+
+### Chat возвращает 401
+
+Проверьте, что `VITE_SUPABASE_URL` и `SUPABASE_URL` относятся к одному проекту,
+затем очистите site data и войдите заново.
+
+### GigaChat не отвечает
+
+Проверьте Authorization key и доступные модели диагностическим скриптом:
 
 ```powershell
 python backend/scripts/check_gigachat_api.py --insecure
 ```
 
-Ключ и Access token скрипт не печатает и не записывает. После успешного ответа
-скопируйте показанный model id в `GIGACHAT_MODEL`; не используйте `--insecure` в
-Edge Function или production backend.
-Ошибка OAuth `Can't decode 'Authorization' header` означает, что скопирован не
-Authorization key или не всё его значение. В кабинете откройте **Настроить API →
-Перейти к ключам**, создайте ключ и используйте кнопку копирования полного
-Authorization key; не вводите лицевой счёт, короткий ID, Access token или текст
-`Authorization: Basic`.
+`--insecure` допустим только для локальной диагностики TLS. Backend не должен
+отключать проверку сертификатов в production.
 
-`Read-Host -AsSecureString` намеренно показывает только звёздочки. Вставляйте
-ключ один раз и нажимайте Enter: повторный `Ctrl+V` дублирует ключ. Для Supabase
-CLI в Windows PowerShell 5.1 надёжнее один раз скопировать ключ в буфер и выполнить:
+## Структура проекта
 
-```powershell
-$authKey = ([string](Get-Clipboard -Raw)).Trim()
-npx supabase secrets set "GIGACHAT_AUTH_KEY=$authKey" --project-ref <your-project-ref>
-Remove-Variable authKey
-Set-Clipboard -Value ""
+```text
+backend/app/
+  agents/       LangGraph router, retriever и specialists
+  api/          FastAPI endpoints
+  auth/         Supabase JWT validation
+  rag/          retrieval и ingestion contracts
+  services/     jobs, conversations, tracing, Supabase
+  tools/        read/write инструменты агента
+  workers/      Celery application и tasks
+supabase/
+  migrations/   PostgreSQL, RLS, pgvector и agent traces
+src/            React frontend
+compose.yaml    Redis, FastAPI и Celery worker
 ```
 
-Колонка `digest` в `supabase secrets list` содержит необратимый хеш, а не сам
-secret, поэтому она никогда не должна совпадать с Authorization key из кабинета.
+## Лицензия
 
----
-
-## Статус
-
-**Готово:** tool calling с GigaChat, инструменты профиля и питания, семантический
-поиск (Recall@5 = 93%), пайплайн импорта с валидацией данных, набор для замера
-качества поиска.
-
-**В работе:** подключение мобильного клиента к FastAPI, сохранение agent traces,
-интеграционные тесты и деплой бэкенда.
-
-**Далее:** MCP, Vision AI для распознавания блюд по фото, аналитическая панель.
+Добавьте условия лицензии проекта перед публичным распространением.
